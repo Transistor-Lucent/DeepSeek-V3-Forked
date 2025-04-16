@@ -13,7 +13,7 @@ from kernel import act_quant, weight_dequant, fp8_gemm
 world_size = 1
 rank = 0
 block_size = 128
-gemm_impl: Literal["bf16", "fp8"] = "bf16"
+gemm_impl: Literal["bf16", "fp8"] = "bf16"  # Literal指某个变量的值只能是几个常量（此为"bf16"或"fp8"）中的一个
 attn_impl: Literal["naive", "absorb"] = "absorb"
 
 @dataclass
@@ -84,6 +84,7 @@ class ModelArgs:
     mscale: float = 1.
 
 
+# Embedding layer：将离散输入（如词 ID）映射到连续向量空间
 class ParallelEmbedding(nn.Module):
     """
     Embedding layer with parallelism support across distributed processes.
@@ -96,6 +97,8 @@ class ParallelEmbedding(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
+
+        # 为分布式计算分割任务
         assert vocab_size % world_size == 0, f"Vocabulary size must be divisible by world size (world_size={world_size})"
         self.part_vocab_size = (vocab_size // world_size)
         self.vocab_start_idx = rank * self.part_vocab_size
@@ -120,9 +123,11 @@ class ParallelEmbedding(nn.Module):
             x = x - self.vocab_start_idx
             x[mask] = 0
         y = F.embedding(x, self.weight)
+
         if world_size > 1:
             y[mask] = 0
             dist.all_reduce(y)
+
         return y
 
 
@@ -148,8 +153,8 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
         - If `gemm_impl == "bf16"`, dequantization and a `bf16` GEMM operation are applied.
         - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
     """
-    if weight.element_size() > 1:
-        return F.linear(x, weight, bias)
+    if weight.element_size() > 1:  # element_size()返回tensor中每个元素的字节数
+        return F.linear(x, weight, bias)  # output=x * weight^T + bias. x.shape: [batchSize, in], weight.shape: [out, in], bias.shape: [out]
     elif gemm_impl == "bf16":
         weight = weight_dequant(weight, weight.scale)
         return F.linear(x, weight, bias)
@@ -178,12 +183,18 @@ class Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+
+        # 设置weight相关函数
         if self.weight.element_size() == 1:
+            # 计算需要几个block_size大小的block才能cover住out_features个特征
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
+            # nn.Parameter将tensor标记为模型中的可学习参数。此处为将weight中的scale设置为可学习的参数
             self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
         else:
-            self.register_parameter("scale", None)
+            self.register_parameter("scale", None)  # nn.Module.register_parameter()会将一个自定义参数注册到模型中。此句之后就可以通过self.scale访问这里定义的参数
+
+        # 设置可学习的bias参数
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features))
         else:
@@ -202,6 +213,7 @@ class Linear(nn.Module):
         return linear(x, self.weight, self.bias)
 
 
+# 切分为许多行向量组进行并行计算
 class ColumnParallelLinear(Linear):
     """
     Linear layer with column parallelism, splitting output features across distributed processes.
@@ -409,13 +421,18 @@ class MLA(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.dim = args.dim
+
         self.n_heads = args.n_heads
         self.n_local_heads = args.n_heads // world_size
+
+        # 低秩投影，即加小型中间层减少参数量（512->512中间加一层64变成512->16->512，则参数量由512*512变为了512*16 + 16*512）
         self.q_lora_rank = args.q_lora_rank
         self.kv_lora_rank = args.kv_lora_rank
+
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.qk_rope_head_dim = args.qk_rope_head_dim
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
+
         self.v_head_dim = args.v_head_dim
 
         if self.q_lora_rank == 0:
@@ -424,6 +441,7 @@ class MLA(nn.Module):
             self.wq_a = Linear(self.dim, self.q_lora_rank)
             self.q_norm = RMSNorm(self.q_lora_rank)
             self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
@@ -433,14 +451,14 @@ class MLA(nn.Module):
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        if attn_impl == "naive":
+        if attn_impl == "naive":  # 选择naive模式和absorb模式，区别是存储k、v的形式
             self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
             self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
         else:
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):  # Optional[torch.Tensor]指这个变量可以是Tensor或是None
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
 
@@ -459,12 +477,18 @@ class MLA(nn.Module):
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+
+        # 把图2 MLA左边的一条
+        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)  # reshape
+        # 左边的设置旋转位置编码
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
+
+        # 图2 MLA中间的一条
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+
         if attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(self.kv_norm(kv))
@@ -476,12 +500,13 @@ class MLA(nn.Module):
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)  # -1表示此维度的值由pytorch自动推导
+            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])  # einsum即实现query的投影
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
+
         if mask is not None:
             scores += mask.unsqueeze(1)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
@@ -526,7 +551,7 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))  # w3作为注意力系数
 
 
 class Gate(nn.Module):
@@ -575,7 +600,9 @@ class Gate(nn.Module):
             scores = scores.softmax(dim=-1, dtype=torch.float32)
         else:
             scores = scores.sigmoid()
+
         original_scores = scores
+
         if self.bias is not None:
             scores = scores + self.bias
         if self.n_groups > 1:
@@ -587,7 +614,8 @@ class Gate(nn.Module):
             indices = group_scores.topk(self.topk_groups, dim=-1)[1]
             mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
             scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
+        indices = torch.topk(scores, self.topk, dim=-1)[1]  # scores中前self.topk个最大值的索引（取[0]则为前self.topk个最大值）
+
         weights = original_scores.gather(1, indices)
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
@@ -751,10 +779,12 @@ class Transformer(nn.Module):
         Args:
             args (ModelArgs): Model arguments containing transformer parameters.
         """
+        # 分布式计算的参数
         global world_size, rank
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
+        world_size = dist.get_world_size() if dist.is_initialized() else 1  # world_size即当前参与分布式训练的进程或 GPU总数量
+        rank = dist.get_rank() if dist.is_initialized() else 0  # 返回当前进程在整个分布式训练中的“编号”
+
+        Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16  # bfloat16有8位指数（float16只有5位）
         super().__init__()
         self.max_seq_len = args.max_seq_len
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)
@@ -763,9 +793,9 @@ class Transformer(nn.Module):
             self.layers.append(Block(layer_id, args))
         self.norm = RMSNorm(args.dim)
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
-        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)  # 注册一个缓冲区变量，会加载和保存，但不会学习
 
-    @torch.inference_mode()
+    @torch.inference_mode()  # 标记model在推理（inference）模式下运行（类似with torch.no_grad()和model.eval()）
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
         """
         Forward pass for the Transformer model.
@@ -779,14 +809,20 @@ class Transformer(nn.Module):
         """
         seqlen = tokens.size(1)
         h = self.embed(tokens)
-        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]  # 分割列并行计算的数据放入缓冲区
         mask = None
+
         if seqlen > 1:
+            # triu_(1)设置范围为主对角线以上，-inf为负无穷大，此即设置上三角为负无穷大，防止模型看到未来的token
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+
+        # 列并行计算，通过多个block
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)[:, -1]
         logits = self.head(h)
+
+        # 合并分布式计算的结果
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)

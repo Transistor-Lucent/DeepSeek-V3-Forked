@@ -177,7 +177,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-path", type=str, required=True)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--input-file", type=str, default="")
-    parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--interactive", action="store_true")  # 命令行中出现了--interactive，则设置interactive为true，没出现则为false
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.2)
     args = parser.parse_args()

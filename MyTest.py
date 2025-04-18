@@ -34,5 +34,4 @@ def wstar(x, y):
 
 
 if __name__ == "__main__":
-    a = [1, 2, 3]
-    print(a[:2])
+    print(torch.cuda.is_available())

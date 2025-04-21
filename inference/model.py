@@ -84,7 +84,7 @@ class ModelArgs:
     mscale: float = 1.
 
 
-# Embedding layer：将离散输入（如词 ID）映射到连续向量空间
+# Embedding layer：将离散输入（如token id）映射到连续向量空间
 class ParallelEmbedding(nn.Module):
     """
     Embedding layer with parallelism support across distributed processes.
@@ -98,9 +98,9 @@ class ParallelEmbedding(nn.Module):
         self.vocab_size = vocab_size
         self.dim = dim
 
-        # 为分布式计算分割任务
+        # 为分布式计算分配词表
         assert vocab_size % world_size == 0, f"Vocabulary size must be divisible by world size (world_size={world_size})"
-        self.part_vocab_size = (vocab_size // world_size)
+        self.part_vocab_size = (vocab_size // world_size)  # 该分布式计算设备分得的词表size
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
@@ -706,10 +706,11 @@ class MoE(nn.Module):
         weights, indices = self.gate(x)
         y = torch.zeros_like(x)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+        # 对专家进行循环，处理所有需要该专家处理的token，提升计算性能
         for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0:
                 continue
-            expert = self.experts[i]
+            expert = self.experts[i]  # 选择专家
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx]) * weights[idx, top, None]
         z = self.shared_experts(x)
